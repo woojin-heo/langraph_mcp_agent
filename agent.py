@@ -26,7 +26,7 @@ load_dotenv()
 SERVERS = {
     "calendar": "servers/gcalendar.py",
     # "gmail": "servers/gmail.py",      # Uncomment to enable
-    # "maps": "servers/maps.py",        # Uncomment to enable
+    "maps": "servers/maps.py",        # Uncomment to enable
 }
 
 # Tools that require human approval (data-changing operations)
