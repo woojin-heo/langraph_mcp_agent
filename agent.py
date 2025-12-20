@@ -26,16 +26,35 @@ load_dotenv()
 SERVERS = {
     "calendar": "servers/gcalendar.py",
     # "gmail": "servers/gmail.py",      # Uncomment to enable
-    "maps": "servers/maps.py",        # Uncomment to enable
+    "maps": "servers/maps.py",
 }
 
 # Tools that require human approval (data-changing operations)
 TOOLS_REQUIRING_APPROVAL = ["create_event", "delete_event", "update_event"]
 
-SYSTEM_PROMPT = f"""You are a helpful assistant with access to various Google services.
-Use the available tools when needed.
+SYSTEM_PROMPT = f"""You are a helpful personal assistant with access to Google Calendar and Maps.
 
 Current date and time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+=== Response Format ===
+- Do NOT use markdown formatting (no **, __, `, ```, etc.)
+- Use plain text with emojis for visual formatting
+- Use line breaks and indentation for structure
+- Always respond in the same language as the user
+
+=== Calendar Tool Usage ===
+When user asks for events, use get_events with:
+
+1. Quick shortcuts (period parameter):
+   - "today", "tomorrow", "week", "next_week", "last_week"
+   - Example: get_events(period="week") for this week
+
+2. Custom date ranges (start_date + end_date):
+   - For months: start_date="2025-12-01", end_date="2025-12-31"
+   - For specific periods: Calculate the exact dates from user's request
+   - Example: "이번 달" (this month) → calculate first and last day of current month
+   - Example: "다음 달" (next month) → calculate first and last day of next month
+   - Example: "내년 1월" → start_date="2026-01-01", end_date="2026-01-31"
 """
 
 
@@ -140,7 +159,9 @@ class MCPConnection:
         self._session = None
     
     async def connect(self):
-        params = StdioServerParameters(command="python3", args=[self.script])
+        import sys
+        # Use the same Python interpreter that's running this script
+        params = StdioServerParameters(command=sys.executable, args=[self.script])
         self._client = stdio_client(params)
         read, write = await self._client.__aenter__()
         self._session = ClientSession(read, write)
@@ -219,7 +240,15 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-def create_graph(mcp: MultiMCPClient):
+def create_graph(mcp: MultiMCPClient, use_cli_approval: bool = True):
+    """
+    Create LangGraph agent.
+    
+    Args:
+        mcp: MultiMCPClient instance
+        use_cli_approval: If True, use CLI-based human approval (for terminal).
+                         If False, skip approval in graph (for Telegram/external approval).
+    """
     llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(mcp.tools)
     
     async def chat(state: State):
@@ -236,8 +265,8 @@ def create_graph(mcp: MultiMCPClient):
             tool_name = tc["name"]
             tool_args = tc["args"]
             
-            # Human-in-the-Loop: check if tool requires approval
-            if tool_name in TOOLS_REQUIRING_APPROVAL:
+            # Human-in-the-Loop: CLI approval (only if enabled)
+            if use_cli_approval and tool_name in TOOLS_REQUIRING_APPROVAL:
                 approved, modified_args = get_human_approval(tool_name, tool_args)
                 
                 if not approved:
