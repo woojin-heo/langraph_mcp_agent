@@ -37,9 +37,8 @@ def get_service():
     
     return build('calendar', 'v3', credentials=creds)
 
-
-@mcp.tool()
-def get_events(days: int = 7) -> str:
+# === Actual functions ===
+def _get_events(days: int = 7) -> str:
     """Get the next N days schedule of your calendar."""
     service = get_service()
 
@@ -65,8 +64,7 @@ def get_events(days: int = 7) -> str:
     return output
 
 
-@mcp.tool()
-def create_event(title: str, start: str, end: str, location: str = "") -> str:
+def _create_event(title: str, start: str, end: str, location: str = "") -> str:
     """
     Create new schedule.
     start/end format: 2025-12-15T10:00:00
@@ -83,6 +81,14 @@ def create_event(title: str, start: str, end: str, location: str = "") -> str:
     created = service.events().insert(calendarId='primary', body=event).execute()
     return f"✅ Created: {title}\nLocation: {location or 'Not specified'}\nlink: {created.get('htmlLink')}"
 
+# === MCP Tool wrapper ===
+@mcp.tool()
+def get_events(days: int = 7) -> str:
+    return _get_events(days)
+
+@mcp.tool()
+def create_event(title: str, start: str, end: str, location: str = "") -> str:
+    return _create_event(title, start, end, location)
 
 if __name__ == "__main__":
     mcp.run()

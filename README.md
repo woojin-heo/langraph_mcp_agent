@@ -22,7 +22,7 @@ A modular Google services agent built with **LangGraph** and **FastMCP**.
 |--------|--------|-------|
 | 📅 Calendar | ✅ Ready | `get_events`, `create_event` |
 | 📧 Gmail | 🚧 Template | `search_emails`, `send_email`, `get_unread_emails` |
-| 🗺️ Maps | 🚧 Template | `search_places`, `get_directions`, `get_place_details` |
+| 🗺️ Maps | ✅ Ready | `search_places`, `get_directions`, `get_place_details` |
 
 ## Quick Start
 
