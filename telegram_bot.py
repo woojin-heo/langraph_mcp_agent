@@ -1,8 +1,9 @@
 """
 Telegram Bot for LangGraph + MCP Agent
-User ID restricted for security
+Multi-user support with individual Google Calendar OAuth
 """
 import os
+import httpx
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -12,13 +13,17 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 # Reuse components from agent.py (no duplication!)
 from agent import MultiMCPClient, create_graph, SERVERS, TOOLS_REQUIRING_APPROVAL
+from user_token_manager import token_manager
+from servers.gcalendar import set_current_user
 
 load_dotenv()
 
 # ============== Configuration ==============
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ALLOWED_USER_IDS is now optional - can allow any authenticated user
 ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv("ALLOWED_USER_IDS", "").split(",") if id.strip()]
+OAUTH_SERVER_URL = os.getenv("OAUTH_SERVER_URL", "http://localhost:8000")
 
 # ============== Global State ==============
 
@@ -31,21 +36,41 @@ pending_approvals = {}  # user_id -> {tool_name, tool_args, tool_call_id, full_r
 # ============== Security ==============
 
 def is_authorized(user_id: int) -> bool:
-    """Check if user is authorized"""
-    if not ALLOWED_USER_IDS:
-        print("⚠️ Warning: ALLOWED_USER_IDS not set. Denying all access.")
-        return False
-    return user_id in ALLOWED_USER_IDS
+    """
+    Check if user is authorized.
+    If ALLOWED_USER_IDS is set, only those users can access.
+    If not set, any user who has connected their calendar can access.
+    """
+    if ALLOWED_USER_IDS:
+        return user_id in ALLOWED_USER_IDS
+    # If no whitelist, allow any authenticated user
+    return True
 
 
-async def security_check(update: Update) -> bool:
-    """Check authorization and log access attempts"""
+def is_calendar_connected(user_id: int) -> bool:
+    """Check if user has connected their Google Calendar"""
+    return token_manager.has_token(user_id)
+
+
+async def security_check(update: Update, require_calendar: bool = True) -> bool:
+    """
+    Check authorization and calendar connection.
+    Returns False if access should be denied.
+    """
     user_id = update.effective_user.id
     user_name = update.effective_user.username or "unknown"
     
     if not is_authorized(user_id):
         print(f"⛔ Unauthorized access attempt: {user_id} (@{user_name})")
         await update.message.reply_text("⛔ Access denied.")
+        return False
+    
+    if require_calendar and not is_calendar_connected(user_id):
+        # User needs to connect calendar first
+        await update.message.reply_text(
+            "🔗 Please connect your Google Calendar first!\n\n"
+            "Use /connect to link your account."
+        )
         return False
     
     return True
@@ -76,9 +101,26 @@ async def init_agent():
 
 async def start_command(update: Update, context):
     """Handle /start command"""
-    if not await security_check(update):
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ Access denied.")
         return
     
+    # Check if calendar is connected
+    if not is_calendar_connected(user_id):
+        # Show connect button first
+        keyboard = [[InlineKeyboardButton("🔗 Connect Google Calendar", callback_data="connect_calendar")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "👋 Hello! I am AI assistant for your daily tasks.\n\n"
+            "To get started, please connect your Google Calendar first!",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Calendar is connected, show main menu
     keyboard = [
         ["📅 Today's schedule", "📅 This week's schedule"],
         ["➕ Add event", "🗺️ Find directions"],
@@ -87,16 +129,100 @@ async def start_command(update: Update, context):
     
     await update.message.reply_text(
         "👋 Hello! I am AI assistant for your daily tasks.\n\n"
+        "✅ Google Calendar connected!\n\n"
         "Send a message or click the buttons below!\n\n"
         "Example: 'Tell me about my tomorrow\'s schedule', 'Find the way from Seoul Station to Gangnam Station'\n\n"
-        "🔒 Operations that require approval: create/update/delete events.",
+        "🔒 Operations that require approval: create/update/delete events.\n\n"
+        "Commands:\n"
+        "/disconnect - Disconnect Google Calendar",
+        reply_markup=reply_markup
+    )
+
+
+async def connect_command(update: Update, context):
+    """Handle /connect command - start OAuth flow"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    
+    if is_calendar_connected(user_id):
+        await update.message.reply_text(
+            "✅ Your Google Calendar is already connected!\n\n"
+            "Use /disconnect to unlink and connect a different account."
+        )
+        return
+    
+    await send_oauth_link(update, user_id)
+
+
+async def send_oauth_link(update: Update, user_id: int):
+    """Generate and send OAuth link to user"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{OAUTH_SERVER_URL}/oauth/start/{user_id}")
+            
+            if response.status_code != 200:
+                await update.message.reply_text(
+                    "❌ OAuth server error. Please make sure oauth_server.py is running."
+                )
+                return
+            
+            data = response.json()
+            auth_url = data["auth_url"]
+            
+            keyboard = [[InlineKeyboardButton("🔗 Connect Google Account", url=auth_url)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "🔐 Google Calendar Connection\n\n"
+                "Click the button below to connect your Google account.\n"
+                "After authorization, return here and send /start again.",
+                reply_markup=reply_markup
+            )
+    
+    except httpx.ConnectError:
+        await update.message.reply_text(
+            "❌ Cannot connect to OAuth server.\n\n"
+            "Please make sure oauth_server.py is running:\n"
+            "`python oauth_server.py`"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def disconnect_command(update: Update, context):
+    """Handle /disconnect command - remove OAuth token"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    
+    if not is_calendar_connected(user_id):
+        await update.message.reply_text("ℹ️ You don't have a connected Google Calendar.")
+        return
+    
+    # Confirm before disconnecting
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, disconnect", callback_data="confirm_disconnect"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_disconnect"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "⚠️ Are you sure you want to disconnect your Google Calendar?\n\n"
+        "You will need to reconnect to use calendar features.",
         reply_markup=reply_markup
     )
 
 
 async def help_command(update: Update, context):
     """Handle /help command"""
-    if not await security_check(update):
+    if not await security_check(update, require_calendar=False):
         return
     
     await update.message.reply_text(
@@ -109,6 +235,8 @@ async def help_command(update: Update, context):
         "• Find the way from Seoul Station to Gangnam Station using public transportation\n\n"
         "⚙️ Commands\n"
         "/start - Start\n"
+        "/connect - Connect Google Calendar\n"
+        "/disconnect - Disconnect Google Calendar\n"
         "/help - Help\n"
         "/clear - Clear conversation",
     )
@@ -127,11 +255,14 @@ async def clear_command(update: Update, context):
 
 async def handle_message(update: Update, context):
     """Handle text messages"""
-    if not await security_check(update):
+    if not await security_check(update, require_calendar=True):
         return
     
     user_id = update.effective_user.id
     user_text = update.message.text
+    
+    # Set current user context for multi-user calendar access
+    set_current_user(user_id)
     
     # Initialize user messages if needed
     if user_id not in user_messages:
@@ -219,8 +350,8 @@ async def send_approval_request(update: Update, tool_name: str, args: dict):
     )
 
 
-async def handle_approval_callback(update: Update, context):
-    """Handle approval button clicks"""
+async def handle_callback(update: Update, context):
+    """Handle all callback button clicks"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -230,11 +361,72 @@ async def handle_approval_callback(update: Update, context):
     
     await query.answer()  # Acknowledge button click
     
+    # Handle connect calendar button
+    if query.data == "connect_calendar":
+        await query.edit_message_text("🔄 Generating connection link...")
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{OAUTH_SERVER_URL}/oauth/start/{user_id}")
+                
+                if response.status_code != 200:
+                    await query.edit_message_text(
+                        "❌ OAuth server error. Please make sure oauth_server.py is running."
+                    )
+                    return
+                
+                data = response.json()
+                auth_url = data["auth_url"]
+                
+                keyboard = [[InlineKeyboardButton("🔗 Connect Google Account", url=auth_url)]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    "🔐 Google Calendar Connection\n\n"
+                    "Click the button below to connect your Google account.\n"
+                    "After authorization, send /start again.",
+                    reply_markup=reply_markup
+                )
+        
+        except httpx.ConnectError:
+            await query.edit_message_text(
+                "❌ Cannot connect to OAuth server.\n\n"
+                "Please make sure oauth_server.py is running."
+            )
+        return
+    
+    # Handle disconnect confirmation
+    if query.data == "confirm_disconnect":
+        token_manager.delete_token(user_id)
+        # Clear user messages
+        user_messages.pop(user_id, None)
+        await query.edit_message_text(
+            "✅ Google Calendar disconnected.\n\n"
+            "Use /connect to link a new account."
+        )
+        return
+    
+    if query.data == "cancel_disconnect":
+        await query.edit_message_text("ℹ️ Disconnect cancelled.")
+        return
+    
+    # Handle approval buttons
+    if query.data in ("approve", "cancel"):
+        await handle_approval_callback(query, user_id)
+        return
+
+
+async def handle_approval_callback(query, user_id: int):
+    """Handle approval button clicks (approve/cancel)"""
+    
     if user_id not in pending_approvals:
         await query.edit_message_text("⏰ Approval request has expired.")
         return
     
     pending = pending_approvals.pop(user_id)
+    
+    # Set user context for calendar operations
+    set_current_user(user_id)
     
     if query.data == "approve":
         await query.edit_message_text("⏳ Executing...")
@@ -300,10 +492,12 @@ def main():
     
     # Add handlers
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("connect", connect_command))
+    app.add_handler(CommandHandler("disconnect", disconnect_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_approval_callback))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     
     # Start polling
     print("✅ Bot is running! Press Ctrl+C to stop.")

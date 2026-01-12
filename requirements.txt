@@ -8,4 +8,7 @@ google-api-python-client
 googlemaps
 pytz
 python-telegram-bot
+fastapi
+uvicorn
+httpx
 

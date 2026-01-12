@@ -1,7 +1,9 @@
 """
 FastMCP Google Calendar server
+Supports multi-user OAuth tokens via user_id
 """
 import os
+import sys
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -12,6 +14,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from user_token_manager import token_manager
+
 load_dotenv()
 
 mcp = FastMCP("Calendar")
@@ -21,7 +27,41 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 CREDENTIALS_PATH = os.getenv('GOOGLE_CREDENTIALS_PATH', 'gcalendar_credentials.json')
 TOKEN_PATH = os.getenv('GOOGLE_TOKEN_PATH', 'gcalendar_token.json')
 
-def get_service():
+# Current user context (set by agent before calling tools)
+_current_user_id = None
+
+
+def set_current_user(user_id: int):
+    """Set the current user context for multi-user support"""
+    global _current_user_id
+    _current_user_id = user_id
+
+
+def get_current_user() -> int:
+    """Get the current user context"""
+    return _current_user_id
+
+
+def get_service(user_id: int = None):
+    """
+    Get Google Calendar service for a specific user.
+    If user_id is provided, use their token.
+    Otherwise, fall back to the default token file (for single-user mode).
+    """
+    # Determine which user to use
+    effective_user_id = user_id or _current_user_id
+    
+    if effective_user_id:
+        # Multi-user mode: load from token manager
+        creds = token_manager.load_credentials(effective_user_id)
+        if not creds:
+            raise ValueError(
+                f"User {effective_user_id} has not connected their Google Calendar. "
+                "Please use /connect command first."
+            )
+        return build('calendar', 'v3', credentials=creds)
+    
+    # Single-user mode: use default token file
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
