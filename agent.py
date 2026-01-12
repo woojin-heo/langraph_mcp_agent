@@ -3,7 +3,8 @@ LangGraph + FastMCP Multi-Server Agent with Human-in-the-Loop
 """
 import asyncio
 import json
-from typing import Annotated, TypedDict, Any, Optional
+from typing import Annotated, TypedDict, Any, Optional, Literal
+import re
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, create_model
 from datetime import datetime
@@ -38,7 +39,7 @@ Current date and time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 === Response Format ===
 - Do NOT use markdown formatting (no **, __, `, ```, etc.)
-- Use plain text with emojis for visual formatting
+- Use plain text for visual formatting
 - Use line breaks and indentation for structure
 - Always respond in the same language as the user
 
@@ -234,30 +235,243 @@ class MultiMCPClient:
             await conn.disconnect()
 
 
+# ============== User Configuration ==============
+
+USER_CONFIG = {
+    "default_location": "redhill mrt station",           # Default origin for travel calculations
+    "default_transport": "transit",         # transit, driving, walking, bicycling
+    "buffer_minutes": 10,                   # Extra time buffer before appointments
+}
+
+
 # ============== LangGraph Agent ==============
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+    intent: str                             # User intent: check_schedule, create_event, general
+    events: list[dict]                      # Fetched calendar events
+    travel_info: list[dict]                 # Travel information for events with locations
+    user_config: dict                       # User preferences
 
 
 def create_graph(mcp: MultiMCPClient, use_cli_approval: bool = True):
     """
-    Create LangGraph agent.
+    Create LangGraph agent with intent-based workflow.
     
-    Args:
-        mcp: MultiMCPClient instance
-        use_cli_approval: If True, use CLI-based human approval (for terminal).
-                         If False, skip approval in graph (for Telegram/external approval).
+    Flow:
+    START -> classify_intent -> route_by_intent:
+        - check_schedule -> fetch_schedule -> check_locations:
+            - has_location -> enrich_with_travel -> generate_response -> END
+            - no_location -> generate_response -> END
+        - create_event/general -> chat -> router:
+            - has_tool_calls -> tools -> chat
+            - no_tool_calls -> END
     """
-    llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(mcp.tools)
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    llm_with_tools = llm.bind_tools(mcp.tools)
     
-    async def chat(state: State):
+    # ============== Intent Classification ==============
+    
+    async def classify_intent(state: State) -> dict:
+        """
+        Classify user intent from the last message.
+        Returns intent: check_schedule, create_event, or general
+        """
+        last_msg = state["messages"][-1]
+        user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+        
+        # Use LLM for intent classification
+        classification_prompt = f"""Classify the user's intent. Return ONLY one of these words:
+- check_schedule: asking about existing events/schedule (e.g., "what's my schedule?", "오늘 뭐해?", "이번주 일정")
+- create_event: wants to create/add a new event (e.g., "add meeting", "일정 추가해줘")
+- general: other requests (directions, place search, general questions)
+
+User message: {user_message}
+
+Intent:"""
+        
+        response = await llm.ainvoke([HumanMessage(content=classification_prompt)])
+        intent_text = response.content.strip().lower()
+        
+        # Parse the intent from response
+        if "check_schedule" in intent_text:
+            intent = "check_schedule"
+        elif "create_event" in intent_text:
+            intent = "create_event"
+        else:
+            intent = "general"
+        
+        return {
+            "intent": intent,
+            "user_config": USER_CONFIG,
+            "events": [],
+            "travel_info": []
+        }
+    
+    # ============== Schedule Workflow ==============
+    
+    async def fetch_schedule(state: State) -> dict:
+        """
+        Fetch calendar events based on user's request.
+        Parses the time period from user message and calls get_events.
+        """
+        last_msg = state["messages"][-1]
+        user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+        
+        # Determine period from user message
+        period_prompt = f"""Extract the time period from this message. Return ONLY one of:
+today, tomorrow, week, next_week, or a date range in format "YYYY-MM-DD to YYYY-MM-DD"
+
+Message: {user_message}
+Current date: {datetime.now().strftime("%Y-%m-%d")}
+
+Period:"""
+        
+        response = await llm.ainvoke([HumanMessage(content=period_prompt)])
+        period_text = response.content.strip().lower()
+        
+        # Call get_events tool
+        try:
+            if "to" in period_text:
+                # Date range format
+                dates = period_text.split("to")
+                start_date = dates[0].strip()
+                end_date = dates[1].strip()
+                result = await mcp.call_tool("get_events", {
+                    "start_date": start_date,
+                    "end_date": end_date
+                })
+            else:
+                # Period shortcut
+                period = period_text if period_text in ["today", "tomorrow", "week", "next_week"] else "today"
+                result = await mcp.call_tool("get_events", {"period": period})
+            
+            # Parse events from result
+            events = parse_events_from_result(result)
+            
+        except Exception as e:
+            events = []
+            result = f"Error fetching events: {e}"
+        
+        return {"events": events}
+    
+    async def enrich_with_travel(state: State) -> dict:
+        """
+        Add travel information for events that have locations.
+        Calculates travel time from user's default location.
+        """
+        events = state.get("events", [])
+        user_config = state.get("user_config", USER_CONFIG)
+        travel_info = []
+        
+        for event in events:
+            location = event.get("location")
+            if not location:
+                continue
+            
+            try:
+                # Get directions from default location to event location
+                directions_result = await mcp.call_tool("get_directions", {
+                    "origin": user_config["default_location"],
+                    "destination": location,
+                    "mode": user_config["default_transport"]
+                })
+                
+                # Parse travel duration
+                duration_minutes = parse_duration_minutes(directions_result)
+                
+                # Calculate suggested departure time
+                event_time = event.get("start_time")
+                if event_time and duration_minutes:
+                    departure_time = calculate_departure_time(
+                        event_time,
+                        duration_minutes,
+                        user_config.get("buffer_minutes", 10)
+                    )
+                else:
+                    departure_time = None
+                
+                travel_info.append({
+                    "event_summary": event.get("summary", ""),
+                    "destination": location,
+                    "origin": user_config["default_location"],
+                    "duration_minutes": duration_minutes,
+                    "duration_text": f"{duration_minutes}분" if duration_minutes else "알 수 없음",
+                    "suggested_departure": departure_time,
+                    "transport_mode": user_config["default_transport"],
+                    "raw_directions": directions_result
+                })
+                
+            except Exception as e:
+                travel_info.append({
+                    "event_summary": event.get("summary", ""),
+                    "destination": location,
+                    "error": str(e)
+                })
+        
+        return {"travel_info": travel_info}
+    
+    async def generate_response(state: State) -> dict:
+        """
+        Generate final response with schedule and travel information.
+        """
+        events = state.get("events", [])
+        travel_info = state.get("travel_info", [])
+        user_config = state.get("user_config", USER_CONFIG)
+        
+        # Build context for response generation
+        context_parts = ["Schedule information:"]
+        
+        if not events:
+            context_parts.append("No events found for the requested period.")
+        else:
+            for event in events:
+                event_str = f"- {event.get('summary', 'Untitled')}"
+                if event.get('start_time'):
+                    event_str += f" at {event['start_time']}"
+                if event.get('location'):
+                    event_str += f" @ {event['location']}"
+                context_parts.append(event_str)
+        
+        if travel_info:
+            context_parts.append("\nTravel information:")
+            for ti in travel_info:
+                if ti.get("error"):
+                    context_parts.append(f"- {ti['destination']}: Could not calculate travel info")
+                else:
+                    travel_str = f"- To {ti['destination']}: {ti['duration_text']} by {ti['transport_mode']}"
+                    if ti.get('suggested_departure'):
+                        travel_str += f", leave by {ti['suggested_departure']}"
+                    context_parts.append(travel_str)
+        
+        context = "\n".join(context_parts)
+        
+        response_prompt = f"""{SYSTEM_PROMPT}
+
+Based on this information, respond to the user naturally in their language.
+Include travel time and suggested departure time if available.
+
+{context}
+
+User's default location: {user_config['default_location']}
+User's default transport: {user_config['default_transport']}"""
+        
+        msgs = [SystemMessage(content=response_prompt)] + state["messages"]
+        response = await llm.ainvoke(msgs)
+        
+        return {"messages": [response]}
+    
+    # ============== General Chat (ReAct style) ==============
+    
+    async def chat(state: State) -> dict:
+        """Standard chat node for general queries and tool usage."""
         msgs = state["messages"]
         if not any(isinstance(m, SystemMessage) for m in msgs):
             msgs = [SystemMessage(content=SYSTEM_PROMPT)] + msgs
-        return {"messages": [await llm.ainvoke(msgs)]}
+        return {"messages": [await llm_with_tools.ainvoke(msgs)]}
     
-    async def tools(state: State):
+    async def tools(state: State) -> dict:
+        """Execute tool calls from the LLM."""
         last = state["messages"][-1]
         results = []
         
@@ -284,18 +498,188 @@ def create_graph(mcp: MultiMCPClient, use_cli_approval: bool = True):
         
         return {"messages": results}
     
-    def router(state: State):
+    # ============== Routers ==============
+    
+    def route_by_intent(state: State) -> Literal["fetch_schedule", "chat"]:
+        """Route based on classified intent."""
+        intent = state.get("intent", "general")
+        if intent == "check_schedule":
+            return "fetch_schedule"
+        # For create_event and general, use standard chat flow
+        return "chat"
+    
+    def check_locations(state: State) -> Literal["enrich_with_travel", "generate_response"]:
+        """Check if any events have locations that need travel info."""
+        events = state.get("events", [])
+        has_location = any(e.get("location") for e in events)
+        return "enrich_with_travel" if has_location else "generate_response"
+    
+    def chat_router(state: State) -> Literal["tools", "__end__"]:
+        """Route after chat: to tools if tool calls exist, else end."""
         last = state["messages"][-1]
         return "tools" if getattr(last, 'tool_calls', None) else "__end__"
     
+    # ============== Build Graph ==============
+    
     g = StateGraph(State)
+    
+    # Add nodes
+    g.add_node("classify_intent", classify_intent)
+    g.add_node("fetch_schedule", fetch_schedule)
+    g.add_node("enrich_with_travel", enrich_with_travel)
+    g.add_node("generate_response", generate_response)
     g.add_node("chat", chat)
     g.add_node("tools", tools)
-    g.add_edge(START, "chat")
-    g.add_conditional_edges("chat", router)
+    
+    # Add edges
+    g.add_edge(START, "classify_intent")
+    g.add_conditional_edges("classify_intent", route_by_intent)
+    
+    # Schedule workflow edges
+    g.add_conditional_edges("fetch_schedule", check_locations)
+    g.add_edge("enrich_with_travel", "generate_response")
+    g.add_edge("generate_response", "__end__")
+    
+    # Chat workflow edges (ReAct loop)
+    g.add_conditional_edges("chat", chat_router)
     g.add_edge("tools", "chat")
     
     return g.compile()
+
+
+# ============== Helper Functions ==============
+
+def parse_events_from_result(result: str) -> list[dict]:
+    """
+    Parse calendar events from the get_events tool result string.
+    Returns list of event dicts with summary, start_time, location, etc.
+    """
+    events = []
+    
+    if not result or "No events" in result or "Error" in result:
+        return events
+    
+    # Parse the formatted output from gcalendar.py
+    # Expected format: "• HH:MM - Summary\n  Location: ...\n"
+    lines = result.split('\n')
+    current_event = {}
+    
+    for line in lines:
+        line = line.strip()
+        
+        # New event starts with bullet point and time
+        if line.startswith('•') or line.startswith('-'):
+            if current_event:
+                events.append(current_event)
+            
+            # Parse time and summary: "• 14:00 - Meeting"
+            match = re.match(r'[•\-]\s*(\d{1,2}:\d{2})?\s*[-–]?\s*(.+)', line)
+            if match:
+                time_str = match.group(1)
+                summary = match.group(2).strip()
+                current_event = {
+                    "summary": summary,
+                    "start_time": time_str,
+                    "location": None
+                }
+            else:
+                current_event = {"summary": line.lstrip('•- '), "start_time": None, "location": None}
+        
+        # Location line
+        elif 'Location:' in line or '장소:' in line:
+            if current_event:
+                loc = line.split(':', 1)[-1].strip()
+                if loc and loc.lower() != 'none' and loc != '없음':
+                    current_event["location"] = loc
+        
+        # Alternative location format: "  📍 Location name"
+        elif '📍' in line or line.startswith('  ') and current_event and not current_event.get("location"):
+            loc = line.replace('📍', '').strip()
+            if loc and not loc.startswith(('http', 'www')):
+                current_event["location"] = loc
+    
+    # Don't forget the last event
+    if current_event:
+        events.append(current_event)
+    
+    return events
+
+
+def parse_duration_minutes(directions_result: str) -> Optional[int]:
+    """
+    Parse travel duration in minutes from get_directions result.
+    Handles formats like "Duration: 45 mins", "소요시간: 1시간 30분", etc.
+    """
+    if not directions_result:
+        return None
+    
+    # Try to find duration patterns
+    patterns = [
+        r'Duration:\s*(\d+)\s*min',           # "Duration: 45 mins"
+        r'Duration:\s*(\d+)\s*hour.*?(\d+)?\s*min',  # "Duration: 1 hour 30 mins"
+        r'(\d+)\s*분',                          # "45분"
+        r'(\d+)\s*시간\s*(\d+)?\s*분?',          # "1시간 30분" or "1시간"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, directions_result, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            if len(groups) >= 2 and groups[1]:
+                # Hours and minutes
+                hours = int(groups[0])
+                minutes = int(groups[1]) if groups[1] else 0
+                return hours * 60 + minutes
+            else:
+                # Just minutes or just hours
+                value = int(groups[0])
+                if 'hour' in pattern or '시간' in pattern:
+                    return value * 60
+                return value
+    
+    return None
+
+
+def calculate_departure_time(event_time: str, duration_minutes: int, buffer_minutes: int = 10) -> Optional[str]:
+    """
+    Calculate suggested departure time.
+    
+    Args:
+        event_time: Event start time in "HH:MM" format
+        duration_minutes: Travel duration in minutes
+        buffer_minutes: Extra buffer time
+    
+    Returns:
+        Suggested departure time in "HH:MM" format
+    """
+    if not event_time or not duration_minutes:
+        return None
+    
+    try:
+        # Parse event time
+        if ':' in event_time:
+            hour, minute = map(int, event_time.split(':'))
+        else:
+            return None
+        
+        # Calculate total minutes to subtract
+        total_minutes = duration_minutes + buffer_minutes
+        
+        # Convert to minutes from midnight, subtract, convert back
+        event_minutes = hour * 60 + minute
+        departure_minutes = event_minutes - total_minutes
+        
+        # Handle negative (previous day)
+        if departure_minutes < 0:
+            departure_minutes += 24 * 60
+        
+        dep_hour = departure_minutes // 60
+        dep_minute = departure_minutes % 60
+        
+        return f"{dep_hour:02d}:{dep_minute:02d}"
+        
+    except Exception:
+        return None
 
 
 # ============== Main ==============
