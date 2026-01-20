@@ -14,6 +14,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -33,31 +34,14 @@ SERVERS = {
 # Tools that require human approval (data-changing operations)
 TOOLS_REQUIRING_APPROVAL = ["create_event", "delete_event", "update_event"]
 
-SYSTEM_PROMPT = f"""You are a helpful personal assistant with access to Google Calendar and Maps.
-
-Current date and time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+RESPONSE_FORMAT_PROMPT = f"""You are a helpful personal assistant.
+Current date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 === Response Format ===
-- Do NOT use markdown formatting (no **, __, `, ```, etc.)
+- Do NOT use markdown formatting
 - Use plain text for visual formatting
-- Use line breaks and indentation for structure
 - Always respond in the same language as the user
-
-=== Calendar Tool Usage ===
-When user asks for events, use get_events with:
-
-1. Quick shortcuts (period parameter):
-   - "today", "tomorrow", "week", "next_week", "last_week"
-   - Example: get_events(period="week") for this week
-
-2. Custom date ranges (start_date + end_date):
-   - For months: start_date="2025-12-01", end_date="2025-12-31"
-   - For specific periods: Calculate the exact dates from user's request
-   - Example: "이번 달" (this month) → calculate first and last day of current month
-   - Example: "다음 달" (next month) → calculate first and last day of next month
-   - Example: "내년 1월" → start_date="2026-01-01", end_date="2026-01-31"
 """
-
 
 # ============== Helper: JSON Schema to Pydantic ==============
 
@@ -256,35 +240,34 @@ class State(TypedDict):
 
 def create_graph(mcp: MultiMCPClient, use_cli_approval: bool = True):
     """
-    Create LangGraph agent with intent-based workflow.
+    Create LangGraph agent with Full Workflow pattern (no ReAct).
     
     Flow:
     START -> classify_intent -> route_by_intent:
-        - check_schedule -> fetch_schedule -> check_locations:
-            - has_location -> enrich_with_travel -> generate_response -> END
-            - no_location -> generate_response -> END
-        - create_event/general -> chat -> router:
-            - has_tool_calls -> tools -> chat
-            - no_tool_calls -> END
+        - check_schedule  -> fetch_schedule -> check_locations -> [enrich_travel] -> generate_response -> END
+        - create_event    -> extract_event_info -> execute_create_event -> generate_response -> END
+        - search_place    -> execute_search_place -> generate_response -> END
+        - get_directions  -> execute_directions -> generate_response -> END
+        - general         -> generate_response -> END (simple response, no tools)
     """
     llm = ChatOpenAI(model="gpt-4o-mini")
-    llm_with_tools = llm.bind_tools(mcp.tools)
     
     # ============== Intent Classification ==============
     
     async def classify_intent(state: State) -> dict:
         """
         Classify user intent from the last message.
-        Returns intent: check_schedule, create_event, or general
+        Intents: check_schedule, create_event, search_place, get_directions, general
         """
         last_msg = state["messages"][-1]
         user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
         
-        # Use LLM for intent classification
         classification_prompt = f"""Classify the user's intent. Return ONLY one of these words:
 - check_schedule: asking about existing events/schedule (e.g., "what's my schedule?", "오늘 뭐해?", "이번주 일정")
-- create_event: wants to create/add a new event (e.g., "add meeting", "일정 추가해줘")
-- general: other requests (directions, place search, general questions)
+- create_event: wants to create/add a new event (e.g., "add meeting tomorrow", "일정 추가해줘")
+- search_place: searching for places/restaurants/etc (e.g., "find restaurants near", "맛집 찾아줘")
+- get_directions: asking for directions/travel time (e.g., "how to get to", "강남역 가는 법")
+- general: other requests, greetings, questions that don't fit above
 
 User message: {user_message}
 
@@ -293,11 +276,15 @@ Intent:"""
         response = await llm.ainvoke([HumanMessage(content=classification_prompt)])
         intent_text = response.content.strip().lower()
         
-        # Parse the intent from response
+        # Parse intent
         if "check_schedule" in intent_text:
             intent = "check_schedule"
         elif "create_event" in intent_text:
             intent = "create_event"
+        elif "search_place" in intent_text:
+            intent = "search_place"
+        elif "get_directions" in intent_text:
+            intent = "get_directions"
         else:
             intent = "general"
         
@@ -305,20 +292,17 @@ Intent:"""
             "intent": intent,
             "user_config": USER_CONFIG,
             "events": [],
-            "travel_info": []
+            "travel_info": [],
         }
     
     # ============== Schedule Workflow ==============
     
     async def fetch_schedule(state: State) -> dict:
-        """
-        Fetch calendar events based on user's request.
-        Parses the time period from user message and calls get_events.
-        """
+        """Fetch calendar events based on user's request."""
         last_msg = state["messages"][-1]
         user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
         
-        # Determine period from user message
+        # Extract period from user message
         period_prompt = f"""Extract the time period from this message. Return ONLY one of:
 today, tomorrow, week, next_week, or a date range in format "YYYY-MM-DD to YYYY-MM-DD"
 
@@ -330,36 +314,29 @@ Period:"""
         response = await llm.ainvoke([HumanMessage(content=period_prompt)])
         period_text = response.content.strip().lower()
         
-        # Call get_events tool
+        # Call get_events and parse JSON result
         try:
-            if "to" in period_text:
-                # Date range format
-                dates = period_text.split("to")
-                start_date = dates[0].strip()
-                end_date = dates[1].strip()
+            if " to " in period_text:
+                dates = period_text.split(" to ")
                 result = await mcp.call_tool("get_events", {
-                    "start_date": start_date,
-                    "end_date": end_date
+                    "start_date": dates[0].strip(),
+                    "end_date": dates[1].strip()
                 })
             else:
-                # Period shortcut
                 period = period_text if period_text in ["today", "tomorrow", "week", "next_week"] else "today"
                 result = await mcp.call_tool("get_events", {"period": period})
             
-            # Parse events from result
-            events = parse_events_from_result(result)
+            # Parse JSON result (new structured format)
+            data = json.loads(result)
+            events = data.get("events", [])
             
         except Exception as e:
             events = []
-            result = f"Error fetching events: {e}"
         
         return {"events": events}
     
     async def enrich_with_travel(state: State) -> dict:
-        """
-        Add travel information for events that have locations.
-        Calculates travel time from user's default location.
-        """
+        """Add travel information for events with locations."""
         events = state.get("events", [])
         user_config = state.get("user_config", USER_CONFIG)
         travel_info = []
@@ -370,36 +347,31 @@ Period:"""
                 continue
             
             try:
-                # Get directions from default location to event location
                 directions_result = await mcp.call_tool("get_directions", {
                     "origin": user_config["default_location"],
                     "destination": location,
                     "mode": user_config["default_transport"]
                 })
                 
-                # Parse travel duration
                 duration_minutes = parse_duration_minutes(directions_result)
-                
-                # Calculate suggested departure time
                 event_time = event.get("start_time")
-                if event_time and duration_minutes:
+                
+                if event_time and duration_minutes and event_time != "All day":
                     departure_time = calculate_departure_time(
-                        event_time,
-                        duration_minutes,
-                        user_config.get("buffer_minutes", 10)
+                        event_time, duration_minutes, user_config.get("buffer_minutes", 10)
                     )
                 else:
                     departure_time = None
                 
                 travel_info.append({
                     "event_summary": event.get("summary", ""),
+                    "event_date": event.get("date", ""),
                     "destination": location,
                     "origin": user_config["default_location"],
                     "duration_minutes": duration_minutes,
                     "duration_text": f"{duration_minutes}분" if duration_minutes else "알 수 없음",
                     "suggested_departure": departure_time,
                     "transport_mode": user_config["default_transport"],
-                    "raw_directions": directions_result
                 })
                 
             except Exception as e:
@@ -411,102 +383,260 @@ Period:"""
         
         return {"travel_info": travel_info}
     
+    # ============== Create Event Workflow ==============
+    
+    async def extract_event_info(state: State) -> dict:
+        """Extract event details from user message for creation."""
+        last_msg = state["messages"][-1]
+        user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+        
+        extract_prompt = f"""Extract event details from this message. Return in this exact JSON format:
+{{"title": "event title", "date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM", "location": "place or null"}}
+
+If any field is unclear, use reasonable defaults:
+- end_time: 1 hour after start_time
+- location: null if not specified
+
+Current date: {datetime.now().strftime("%Y-%m-%d")}
+Message: {user_message}
+
+JSON:"""
+        
+        response = await llm.ainvoke([HumanMessage(content=extract_prompt)])
+        
+        try:
+            # Extract JSON from response
+            response_text = response.content.strip()
+            if "```" in response_text:
+                response_text = response_text.split("```")[1].replace("json", "").strip()
+            event_info = json.loads(response_text)
+        except:
+            event_info = {"error": "Could not parse event details"}
+        
+        return {"events": [event_info]}
+    
+    async def execute_create_event(state: State) -> dict:
+        """Execute event creation with human approval."""
+        events = state.get("events", [])
+        if not events:
+            return {"events": [{"error": "No event info to create"}]}
+        
+        event_info = events[0]
+        if event_info.get("error"):
+            return {"events": events}
+        
+        # Build event parameters
+        try:
+            date = event_info.get("date", datetime.now().strftime("%Y-%m-%d"))
+            start_time = event_info.get("start_time", "09:00")
+            end_time = event_info.get("end_time", "10:00")
+            
+            tool_args = {
+                "title": event_info.get("title", "New Event"),
+                "start": f"{date}T{start_time}:00",
+                "end": f"{date}T{end_time}:00",
+                "location": event_info.get("location", "")
+            }
+            
+            # Human approval for create_event
+            if use_cli_approval:
+                approved, modified_args = get_human_approval("create_event", tool_args)
+                if not approved:
+                    return {"events": [{"error": "User cancelled event creation"}]}
+                tool_args = modified_args
+            
+            result = await mcp.call_tool("create_event", tool_args)
+            event_info["result"] = result
+            event_info["success"] = True
+            
+        except Exception as e:
+            event_info["error"] = str(e)
+            event_info["success"] = False
+        
+        return {"events": [event_info]}
+    
+    # ============== Search Place Workflow ==============
+    
+    async def execute_search_place(state: State) -> dict:
+        """Execute place search."""
+        last_msg = state["messages"][-1]
+        user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+        user_config = state.get("user_config", USER_CONFIG)
+        
+        # Extract search query
+        extract_prompt = f"""Extract the place search query from this message.
+Return JSON: {{"query": "search term", "location": "near location or null"}}
+
+Message: {user_message}
+User's default location: {user_config['default_location']}
+
+JSON:"""
+        
+        response = await llm.ainvoke([HumanMessage(content=extract_prompt)])
+        
+        try:
+            response_text = response.content.strip()
+            if "```" in response_text:
+                response_text = response_text.split("```")[1].replace("json", "").strip()
+            search_info = json.loads(response_text)
+        except:
+            search_info = {"query": user_message}
+        
+        # Execute search
+        try:
+            result = await mcp.call_tool("search_places", {
+                "query": search_info.get("query", user_message),
+                "location": search_info.get("location", user_config["default_location"])
+            })
+            search_info["result"] = result
+        except Exception as e:
+            search_info["error"] = str(e)
+        
+        return {"events": [search_info]}
+    
+    # ============== Directions Workflow ==============
+    
+    async def execute_directions(state: State) -> dict:
+        """Execute directions lookup."""
+        last_msg = state["messages"][-1]
+        user_message = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
+        user_config = state.get("user_config", USER_CONFIG)
+        
+        # Extract origin/destination
+        extract_prompt = f"""Extract travel information from this message.
+Return JSON: {{"origin": "start point or null", "destination": "end point", "mode": "transit/driving/walking"}}
+
+If origin is not specified, use null (will use default).
+Default transport mode: {user_config['default_transport']}
+
+Message: {user_message}
+
+JSON:"""
+        
+        response = await llm.ainvoke([HumanMessage(content=extract_prompt)])
+        
+        try:
+            response_text = response.content.strip()
+            if "```" in response_text:
+                response_text = response_text.split("```")[1].replace("json", "").strip()
+            travel_params = json.loads(response_text)
+        except:
+            travel_params = {"destination": user_message}
+        
+        # Execute directions
+        try:
+            result = await mcp.call_tool("get_directions", {
+                "origin": travel_params.get("origin") or user_config["default_location"],
+                "destination": travel_params.get("destination", ""),
+                "mode": travel_params.get("mode", user_config["default_transport"])
+            })
+            travel_params["result"] = result
+        except Exception as e:
+            travel_params["error"] = str(e)
+        
+        return {"travel_info": [travel_params]}
+    
+    # ============== Generate Response (Common) ==============
+    
     async def generate_response(state: State) -> dict:
-        """
-        Generate final response with schedule and travel information.
-        """
+        """Generate final response based on intent and gathered data."""
+        intent = state.get("intent", "general")
         events = state.get("events", [])
         travel_info = state.get("travel_info", [])
         user_config = state.get("user_config", USER_CONFIG)
         
-        # Build context for response generation
-        context_parts = ["Schedule information:"]
+        # Build context based on intent
+        context_parts = []
         
-        if not events:
-            context_parts.append("No events found for the requested period.")
-        else:
-            for event in events:
-                event_str = f"- {event.get('summary', 'Untitled')}"
-                if event.get('start_time'):
-                    event_str += f" at {event['start_time']}"
-                if event.get('location'):
-                    event_str += f" @ {event['location']}"
-                context_parts.append(event_str)
+        if intent == "check_schedule":
+            context_parts.append("=== Schedule Information ===")
+            if not events:
+                context_parts.append("No events found for the requested period.")
+            else:
+                for event in events:
+                    date = event.get("date", "")
+                    day = event.get("day_of_week", "")
+                    time = event.get("start_time", "")
+                    summary = event.get("summary", "Untitled")
+                    location = event.get("location", "")
+                    
+                    event_str = f"- {date} ({day}) {time}: {summary}"
+                    if location:
+                        event_str += f" @ {location}"
+                    context_parts.append(event_str)
+            
+            if travel_info:
+                context_parts.append("\n=== Travel Information ===")
+                for ti in travel_info:
+                    if ti.get("error"):
+                        context_parts.append(f"- {ti.get('destination', 'Unknown')}: Could not calculate")
+                    else:
+                        line = f"- To {ti['destination']}: {ti.get('duration_text', '?')}"
+                        if ti.get('suggested_departure'):
+                            line += f" (leave by {ti['suggested_departure']})"
+                        context_parts.append(line)
         
-        if travel_info:
-            context_parts.append("\nTravel information:")
-            for ti in travel_info:
-                if ti.get("error"):
-                    context_parts.append(f"- {ti['destination']}: Could not calculate travel info")
-                else:
-                    travel_str = f"- To {ti['destination']}: {ti['duration_text']} by {ti['transport_mode']}"
-                    if ti.get('suggested_departure'):
-                        travel_str += f", leave by {ti['suggested_departure']}"
-                    context_parts.append(travel_str)
+        elif intent == "create_event":
+            context_parts.append("=== Event Creation ===")
+            if events and events[0].get("success"):
+                e = events[0]
+                context_parts.append(f"Successfully created: {e.get('title', 'Event')}")
+                context_parts.append(f"Date: {e.get('date', '')} {e.get('start_time', '')} - {e.get('end_time', '')}")
+                if e.get("location"):
+                    context_parts.append(f"Location: {e['location']}")
+            elif events and events[0].get("error"):
+                context_parts.append(f"Failed to create event: {events[0]['error']}")
+            else:
+                context_parts.append("Event creation status unknown")
+        
+        elif intent == "search_place":
+            context_parts.append("=== Search Results ===")
+            if events and events[0].get("result"):
+                context_parts.append(events[0]["result"])
+            elif events and events[0].get("error"):
+                context_parts.append(f"Search failed: {events[0]['error']}")
+        
+        elif intent == "get_directions":
+            context_parts.append("=== Directions ===")
+            if travel_info and travel_info[0].get("result"):
+                context_parts.append(travel_info[0]["result"])
+            elif travel_info and travel_info[0].get("error"):
+                context_parts.append(f"Could not get directions: {travel_info[0]['error']}")
+        
+        else:  # general
+            context_parts.append("(No specific data - respond naturally to the user's message)")
         
         context = "\n".join(context_parts)
         
-        response_prompt = f"""{SYSTEM_PROMPT}
+        response_prompt = f"""{RESPONSE_FORMAT_PROMPT}
 
 Based on this information, respond to the user naturally in their language.
-Include travel time and suggested departure time if available.
 
 {context}
 
-User's default location: {user_config['default_location']}
-User's default transport: {user_config['default_transport']}"""
+User's default location: {user_config['default_location']}"""
         
         msgs = [SystemMessage(content=response_prompt)] + state["messages"]
         response = await llm.ainvoke(msgs)
         
         return {"messages": [response]}
     
-    # ============== General Chat (ReAct style) ==============
-    
-    async def chat(state: State) -> dict:
-        """Standard chat node for general queries and tool usage."""
-        msgs = state["messages"]
-        if not any(isinstance(m, SystemMessage) for m in msgs):
-            msgs = [SystemMessage(content=SYSTEM_PROMPT)] + msgs
-        return {"messages": [await llm_with_tools.ainvoke(msgs)]}
-    
-    async def tools(state: State) -> dict:
-        """Execute tool calls from the LLM."""
-        last = state["messages"][-1]
-        results = []
-        
-        for tc in last.tool_calls:
-            tool_name = tc["name"]
-            tool_args = tc["args"]
-            
-            # Human-in-the-Loop: CLI approval (only if enabled)
-            if use_cli_approval and tool_name in TOOLS_REQUIRING_APPROVAL:
-                approved, modified_args = get_human_approval(tool_name, tool_args)
-                
-                if not approved:
-                    results.append(ToolMessage(
-                        content="❌ User cancelled the operation.",
-                        tool_call_id=tc["id"]
-                    ))
-                    continue
-                
-                tool_args = modified_args
-            
-            # Execute tool
-            r = await mcp.call_tool(tool_name, tool_args)
-            results.append(ToolMessage(content=r, tool_call_id=tc["id"]))
-        
-        return {"messages": results}
-    
     # ============== Routers ==============
     
-    def route_by_intent(state: State) -> Literal["fetch_schedule", "chat"]:
-        """Route based on classified intent."""
+    def route_by_intent(state: State) -> Literal[
+        "fetch_schedule", "extract_event_info", "execute_search_place", 
+        "execute_directions", "generate_response"
+    ]:
+        """Route to appropriate workflow based on intent."""
         intent = state.get("intent", "general")
-        if intent == "check_schedule":
-            return "fetch_schedule"
-        # For create_event and general, use standard chat flow
-        return "chat"
+        routes = {
+            "check_schedule": "fetch_schedule",
+            "create_event": "extract_event_info",
+            "search_place": "execute_search_place",
+            "get_directions": "execute_directions",
+            "general": "generate_response",
+        }
+        return routes.get(intent, "generate_response")
     
     def check_locations(state: State) -> Literal["enrich_with_travel", "generate_response"]:
         """Check if any events have locations that need travel info."""
@@ -514,96 +644,43 @@ User's default transport: {user_config['default_transport']}"""
         has_location = any(e.get("location") for e in events)
         return "enrich_with_travel" if has_location else "generate_response"
     
-    def chat_router(state: State) -> Literal["tools", "__end__"]:
-        """Route after chat: to tools if tool calls exist, else end."""
-        last = state["messages"][-1]
-        return "tools" if getattr(last, 'tool_calls', None) else "__end__"
-    
     # ============== Build Graph ==============
     
     g = StateGraph(State)
     
-    # Add nodes
+    # Add all nodes
     g.add_node("classify_intent", classify_intent)
     g.add_node("fetch_schedule", fetch_schedule)
     g.add_node("enrich_with_travel", enrich_with_travel)
+    g.add_node("extract_event_info", extract_event_info)
+    g.add_node("execute_create_event", execute_create_event)
+    g.add_node("execute_search_place", execute_search_place)
+    g.add_node("execute_directions", execute_directions)
     g.add_node("generate_response", generate_response)
-    g.add_node("chat", chat)
-    g.add_node("tools", tools)
     
-    # Add edges
+    # Entry point
     g.add_edge(START, "classify_intent")
     g.add_conditional_edges("classify_intent", route_by_intent)
     
-    # Schedule workflow edges
+    # Schedule workflow
     g.add_conditional_edges("fetch_schedule", check_locations)
     g.add_edge("enrich_with_travel", "generate_response")
+    
+    # Create event workflow
+    g.add_edge("extract_event_info", "execute_create_event")
+    g.add_edge("execute_create_event", "generate_response")
+    
+    # Search/Directions workflows go directly to response
+    g.add_edge("execute_search_place", "generate_response")
+    g.add_edge("execute_directions", "generate_response")
+    
+    # All paths end at generate_response
     g.add_edge("generate_response", "__end__")
     
-    # Chat workflow edges (ReAct loop)
-    g.add_conditional_edges("chat", chat_router)
-    g.add_edge("tools", "chat")
-    
-    return g.compile()
+    return g
 
 
 # ============== Helper Functions ==============
-
-def parse_events_from_result(result: str) -> list[dict]:
-    """
-    Parse calendar events from the get_events tool result string.
-    Returns list of event dicts with summary, start_time, location, etc.
-    """
-    events = []
-    
-    if not result or "No events" in result or "Error" in result:
-        return events
-    
-    # Parse the formatted output from gcalendar.py
-    # Expected format: "• HH:MM - Summary\n  Location: ...\n"
-    lines = result.split('\n')
-    current_event = {}
-    
-    for line in lines:
-        line = line.strip()
-        
-        # New event starts with bullet point and time
-        if line.startswith('•') or line.startswith('-'):
-            if current_event:
-                events.append(current_event)
-            
-            # Parse time and summary: "• 14:00 - Meeting"
-            match = re.match(r'[•\-]\s*(\d{1,2}:\d{2})?\s*[-–]?\s*(.+)', line)
-            if match:
-                time_str = match.group(1)
-                summary = match.group(2).strip()
-                current_event = {
-                    "summary": summary,
-                    "start_time": time_str,
-                    "location": None
-                }
-            else:
-                current_event = {"summary": line.lstrip('•- '), "start_time": None, "location": None}
-        
-        # Location line
-        elif 'Location:' in line or '장소:' in line:
-            if current_event:
-                loc = line.split(':', 1)[-1].strip()
-                if loc and loc.lower() != 'none' and loc != '없음':
-                    current_event["location"] = loc
-        
-        # Alternative location format: "  📍 Location name"
-        elif '📍' in line or line.startswith('  ') and current_event and not current_event.get("location"):
-            loc = line.replace('📍', '').strip()
-            if loc and not loc.startswith(('http', 'www')):
-                current_event["location"] = loc
-    
-    # Don't forget the last event
-    if current_event:
-        events.append(current_event)
-    
-    return events
-
 
 def parse_duration_minutes(directions_result: str) -> Optional[int]:
     """
@@ -696,10 +773,16 @@ async def main():
         return
     
     print(f"\nTotal tools: {len(mcp.tools)}")
-    print(f"🔒 Approval required for: {TOOLS_REQUIRING_APPROVAL}\n")
+    print(f"🔒 Approval required for: {TOOLS_REQUIRING_APPROVAL}")
     
-    graph = create_graph(mcp)
+    # Create graph with memory checkpointer for state tracking
+    memory = MemorySaver()
+    graph_builder = create_graph(mcp)
+    graph = graph_builder.compile(checkpointer=memory)
     messages = []
+    
+    # Config with thread_id for checkpointer
+    config = {"configurable": {"thread_id": "main-session"}}
     
     try:
         while True:
@@ -710,7 +793,7 @@ async def main():
                 continue
             
             messages.append(HumanMessage(content=user))
-            result = await graph.ainvoke({"messages": messages})
+            result = await graph.ainvoke({"messages": messages}, config=config)
             messages = result["messages"]
             
             print(f"\nAssistant: {messages[-1].content}\n")

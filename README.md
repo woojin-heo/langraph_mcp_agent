@@ -1,4 +1,4 @@
-# 🤖 Multi-Service Agent
+# Personal Assistant Agent
 
 A modular Google services agent built with **LangGraph** and **FastMCP**.
 
@@ -15,6 +15,71 @@ A modular Google services agent built with **LangGraph** and **FastMCP**.
                     └───▶│  Maps Server    │───▶ Google Maps
                          └─────────────────┘
 ```
+
+## Agent Workflow
+
+The agent uses **Full Workflow** pattern (no ReAct loops) for predictable, controlled responses.
+
+```
+START
+  │
+  ▼
+┌─────────────────┐
+│ classify_intent │ ← LLM classifies user intent
+└────────┬────────┘
+         │
+         ▼
+    ┌────┴────┬──────────┬──────────┬──────────┐
+    │         │          │          │          │
+    ▼         ▼          ▼          ▼          ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│ check  │ │ create │ │ search │ │  get   │ │general │
+│schedule│ │ event  │ │ place  │ │  dir   │ │        │
+└───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
+    │          │          │          │          │
+    ▼          ▼          ▼          ▼          │
+┌────────┐ ┌────────┐     │          │          │
+│ fetch  │ │extract │     │          │          │
+│schedule│ │  info  │     │          │          │
+└───┬────┘ └───┬────┘     │          │          │
+    │          ▼          │          │          │
+    │     ┌────────┐      │          │          │
+    │     │execute │      │          │          │
+    │     │ create │      │          │          │
+    │     └───┬────┘      │          │          │
+    ▼         │           │          │          │
+┌────────┐    │           │          │          │
+│enrich  │    │           │          │          │
+│travel? │    │           │          │          │
+└───┬────┘    │           │          │          │
+    │         │           │          │          │
+    └────┬────┴─────┬─────┴────┬─────┴────┬─────┘
+         │          │          │          │
+         ▼          ▼          ▼          ▼
+      ┌─────────────────────────────────────┐
+      │         generate_response           │
+      └─────────────────────────────────────┘
+                      │
+                      ▼
+                     END
+```
+
+### Intents
+
+| Intent | Description | Workflow |
+|--------|-------------|----------|
+| `check_schedule` | View events | fetch → enrich travel → response |
+| `create_event` | Create new event | extract info → execute → response |
+| `search_place` | Search places | search → response |
+| `get_directions` | Get directions | directions → response |
+| `general` | Other requests | response (no tools) |
+
+### Features
+
+- **Predictable flow**: Each intent follows a defined workflow
+- **Auto travel info**: Schedule queries automatically include travel time from your default location
+- **Human-in-the-loop**: Event creation requires user approval
+- **Structured data**: Calendar returns JSON for reliable parsing
 
 ## Available Servers
 
@@ -43,6 +108,7 @@ pip install -r requirements.txt
 
 ```bash
 export OPENAI_API_KEY=your-api-key
+export GOOGLE_MAPS_API_KEY=your-maps-key
 ```
 
 ### 4. Run
@@ -51,60 +117,33 @@ export OPENAI_API_KEY=your-api-key
 python agent.py
 ```
 
-## Enable More Servers
+## User Configuration
 
-Edit `agent.py` and uncomment the servers you want:
+Edit `agent.py` to set your default location and transport:
 
 ```python
-SERVERS = {
-    "calendar": "servers/calendar.py",
-    "gmail": "servers/gmail.py",      # Uncomment to enable
-    "maps": "servers/maps.py",        # Uncomment to enable
+USER_CONFIG = {
+    "default_location": "Redhill",  # Your home/office address
+    "default_transport": "transit",       # transit, driving, walking, bicycling
+    "buffer_minutes": 10,                 # Extra time before appointments
 }
 ```
 
 ## Project Structure
 
 ```
-agent/
-├── agent.py                 # Multi-server LangGraph agent
+langraph_mcp_agent/
+├── agent.py                 # Main agent with Full Workflow
 ├── servers/
-│   ├── calendar.py          # Google Calendar (ready)
-│   ├── gmail.py             # Gmail (template)
-│   └── maps.py              # Google Maps (template)
+│   ├── gcalendar.py         # Google Calendar server
+│   ├── gmail.py             # Gmail server (template)
+│   └── maps.py              # Google Maps server
+├── telegram_bot.py          # Telegram bot integration
+├── oauth_server.py          # OAuth callback server
+├── user_token_manager.py    # Multi-user token management
 ├── requirements.txt
-├── credentials.json         # Google OAuth (you create)
-└── token.json               # Auto-generated
+└── README.md
 ```
-
-## Adding a New Server
-
-1. Create `servers/your_service.py`:
-
-```python
-from fastmcp import FastMCP
-
-mcp = FastMCP("YourService")
-
-@mcp.tool()
-def your_tool(param: str) -> str:
-    """Tool description."""
-    return "result"
-
-if __name__ == "__main__":
-    mcp.run()
-```
-
-2. Register in `agent.py`:
-
-```python
-SERVERS = {
-    ...
-    "your_service": "servers/your_service.py",
-}
-```
-
-3. Done! The agent will auto-discover tools from the new server.
 
 ## Usage Example
 
@@ -113,13 +152,15 @@ SERVERS = {
 
 Connecting to servers...
   ✅ calendar: ['get_events', 'create_event']
+  ✅ maps: ['search_places', 'get_directions', 'get_place_details']
 
-📦 Total tools: 2
+📦 Total tools: 5
+🔒 Approval required for: ['create_event', 'delete_event', 'update_event']
 
-You: What's on my calendar this week?
-Assistant: 📅 7-day schedule:
-• 2024-12-14T10:00: Team meeting
-• 2024-12-15T14:00: Project review
+You: What is today's schedule?
+Assistant: You have a dinner appointment at 8 PM at Botanic Garden.
+It takes about 45 minutes by transit from Redhill.
+Leave by 7:05 PM to arrive on time.
 
 You: q
 👋 Bye

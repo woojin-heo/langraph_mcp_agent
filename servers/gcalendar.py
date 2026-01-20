@@ -108,9 +108,9 @@ def _format_date_range(start: datetime, end: datetime) -> str:
 # === Actual functions ===
 def _get_events(
     start_date: str = None,
-    end_date: str = None,
+    end_date: str = None, 
     period: str = None
-) -> str:
+) -> tuple:
     """
     Get calendar events for a specific date range.
     
@@ -124,47 +124,44 @@ def _get_events(
         period: Shortcut - "today", "tomorrow", "week", "next_week", "last_week", or number of days
     
     Returns:
-        Formatted string with events and date range
+        Tuple of (start_datetime, end_datetime, label_string) or (None, None, error_message)
     """
-    service = get_service()
     now = datetime.now(TZ)
     
-    # Priority: start_date/end_date > period
     if start_date and end_date:
-        # LLM provided specific dates
         try:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ)
             end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
                 hour=23, minute=59, second=59, tzinfo=TZ
             )
-            label = f"📅 {start_date} ~ {end_date}"
+            label = f"{start_date} ~ {end_date}"
+            return start_dt, end_dt, label
         except ValueError:
-            return f"❌ Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-01)"
+            return None, None, "Invalid date format. Use YYYY-MM-DD"
     
     elif period:
-        # Use period shortcuts
         if period == "today":
             start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end_dt = now.replace(hour=23, minute=59, second=59, microsecond=0)
-            label = f"📅 Today ({now.strftime('%m/%d %a')})"
+            label = f"Today ({now.strftime('%m/%d %a')})"
             
         elif period == "tomorrow":
             tomorrow = now + timedelta(days=1)
             start_dt = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
             end_dt = tomorrow.replace(hour=23, minute=59, second=59, microsecond=0)
-            label = f"📅 Tomorrow ({tomorrow.strftime('%m/%d %a')})"
+            label = f"Tomorrow ({tomorrow.strftime('%m/%d %a')})"
             
         elif period in ("week", "this_week"):
             start_dt, end_dt = _get_week_range(now, offset_weeks=0)
-            label = f"📅 This week ({_format_date_range(start_dt, end_dt)})"
+            label = f"This week ({_format_date_range(start_dt, end_dt)})"
             
         elif period == "next_week":
             start_dt, end_dt = _get_week_range(now, offset_weeks=1)
-            label = f"📅 Next week ({_format_date_range(start_dt, end_dt)})"
+            label = f"Next week ({_format_date_range(start_dt, end_dt)})"
             
         elif period == "last_week":
             start_dt, end_dt = _get_week_range(now, offset_weeks=-1)
-            label = f"📅 Last week ({_format_date_range(start_dt, end_dt)})"
+            label = f"Last week ({_format_date_range(start_dt, end_dt)})"
             
         else:
             # Assume it's a number of days
@@ -172,15 +169,56 @@ def _get_events(
                 days = int(period)
                 start_dt = now
                 end_dt = now + timedelta(days=days)
-                label = f"📅 Next {days} days ({now.strftime('%m/%d')} ~ {end_dt.strftime('%m/%d')})"
+                label = f"Next {days} days ({now.strftime('%m/%d')} ~ {end_dt.strftime('%m/%d')})"
             except ValueError:
-                return f"❌ Unknown period: {period}. Use 'today', 'tomorrow', 'week', 'next_week', or a number."
+                return None, None, f"Unknown period: {period}"
+        
+        return start_dt, end_dt, label
     
     else:
         # Default: next 7 days
         start_dt = now
         end_dt = now + timedelta(days=7)
-        label = f"📅 Next 7 days ({now.strftime('%m/%d')} ~ {end_dt.strftime('%m/%d')})"
+        label = f"Next 7 days ({now.strftime('%m/%d')} ~ {end_dt.strftime('%m/%d')})"
+        return start_dt, end_dt, label
+
+
+def _get_events(
+    start_date: str = None,
+    end_date: str = None,
+    period: str = None
+) -> str:
+    """
+    Get calendar events and return as JSON string.
+    
+    Returns JSON with structure:
+    {
+        "label": "Today (01/15 Mon)",
+        "events": [
+            {
+                "summary": "Meeting",
+                "date": "2025-01-15",
+                "day_of_week": "Mon",
+                "start_time": "14:00",
+                "end_time": "15:00",
+                "location": "Office",
+                "event_id": "abc123"
+            }
+        ],
+        "error": null
+    }
+    """
+    import json
+    
+    start_dt, end_dt, label = _get_events(start_date, end_date, period)
+    
+    if start_dt is None:
+        return json.dumps({"label": None, "events": [], "error": label}, ensure_ascii=False)
+    
+    try:
+        service = get_service()
+    except Exception as e:
+        return json.dumps({"label": label, "events": [], "error": str(e)}, ensure_ascii=False)
     
     # Fetch events from Google Calendar
     result = service.events().list(
@@ -192,42 +230,50 @@ def _get_events(
         orderBy='startTime'
     ).execute()
     
-    events = result.get('items', [])
+    raw_events = result.get('items', [])
     
-    if not events:
-        return f"{label}\n\nNo events scheduled."
+    # Parse events into structured format
+    events = []
+    weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     
-    # Format output
-    output = f"{label}\n\n"
-    current_date = None
-    
-    for e in events:
-        # Parse event start time
+    for e in raw_events:
         start_str = e['start'].get('dateTime', e['start'].get('date'))
+        end_str = e['end'].get('dateTime', e['end'].get('date'))
         
-        # Group by date
         if 'T' in start_str:
+            # Timed event
             event_dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-            event_date = event_dt.strftime('%m/%d (%a)')
-            event_time = event_dt.strftime('%H:%M')
+            end_dt_event = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
+            date_str = event_dt.strftime('%Y-%m-%d')
+            day_of_week = weekdays[event_dt.weekday()]
+            start_time = event_dt.strftime('%H:%M')
+            end_time = end_dt_event.strftime('%H:%M')
         else:
-            event_date = start_str
-            event_time = "All day"
+            # All-day event
+            date_str = start_str
+            try:
+                event_dt = datetime.strptime(start_str, "%Y-%m-%d")
+                day_of_week = weekdays[event_dt.weekday()]
+            except:
+                day_of_week = ""
+            start_time = "All day"
+            end_time = "All day"
         
-        # Add date header if new date
-        if event_date != current_date:
-            if current_date is not None:
-                output += "\n"
-            output += f"📆 {event_date}\n"
-            current_date = event_date
-        
-        # Add event
-        title = e.get('summary', 'No title')
-        location = e.get('location', '')
-        loc_str = f" @ {location}" if location else ""
-        output += f"  • {event_time} - {title}{loc_str}\n"
+        events.append({
+            "summary": e.get('summary', 'No title'),
+            "date": date_str,
+            "day_of_week": day_of_week,
+            "start_time": start_time,
+            "end_time": end_time,
+            "location": e.get('location'),
+            "event_id": e.get('id'),
+        })
     
-    return output
+    return json.dumps({
+        "label": label,
+        "events": events,
+        "error": None
+    }, ensure_ascii=False)
 
 
 def _create_event(title: str, start: str, end: str, location: str = "") -> str:
