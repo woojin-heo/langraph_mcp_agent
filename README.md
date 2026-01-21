@@ -20,49 +20,7 @@ A modular Google services agent built with **LangGraph** and **FastMCP**.
 
 The agent uses **Full Workflow** pattern (no ReAct loops) for predictable, controlled responses.
 
-```
-START
-  │
-  ▼
-┌─────────────────┐
-│ classify_intent │ ← LLM classifies user intent
-└────────┬────────┘
-         │
-         ▼
-    ┌────┴────┬──────────┬──────────┬──────────┐
-    │         │          │          │          │
-    ▼         ▼          ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-│ check  │ │ create │ │ search │ │  get   │ │general │
-│schedule│ │ event  │ │ place  │ │  dir   │ │        │
-└───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │          │          │
-    ▼          ▼          ▼          ▼          │
-┌────────┐ ┌────────┐     │          │          │
-│ fetch  │ │extract │     │          │          │
-│schedule│ │  info  │     │          │          │
-└───┬────┘ └───┬────┘     │          │          │
-    │          ▼          │          │          │
-    │     ┌────────┐      │          │          │
-    │     │execute │      │          │          │
-    │     │ create │      │          │          │
-    │     └───┬────┘      │          │          │
-    ▼         │           │          │          │
-┌────────┐    │           │          │          │
-│enrich  │    │           │          │          │
-│travel? │    │           │          │          │
-└───┬────┘    │           │          │          │
-    │         │           │          │          │
-    └────┬────┴─────┬─────┴────┬─────┴────┬─────┘
-         │          │          │          │
-         ▼          ▼          ▼          ▼
-      ┌─────────────────────────────────────┐
-      │         generate_response           │
-      └─────────────────────────────────────┘
-                      │
-                      ▼
-                     END
-```
+![agentworkflow](graph.png)
 
 ### Intents
 
