@@ -3,6 +3,7 @@ FastMCP Google Calendar server
 Supports multi-user OAuth tokens via user_id
 """
 import os
+from pkgutil import get_data
 import sys
 from datetime import datetime, timedelta
 import pytz
@@ -106,7 +107,7 @@ def _format_date_range(start: datetime, end: datetime) -> str:
 
 
 # === Actual functions ===
-def _get_events(
+def _get_date_range(
     start_date: str = None,
     end_date: str = None, 
     period: str = None
@@ -210,7 +211,7 @@ def _get_events(
     """
     import json
     
-    start_dt, end_dt, label = _get_events(start_date, end_date, period)
+    start_dt, end_dt, label = _get_date_range(start_date, end_date, period)
     
     if start_dt is None:
         return json.dumps({"label": None, "events": [], "error": label}, ensure_ascii=False)

@@ -2,9 +2,14 @@
 FastMCP Google Maps Server
 """
 import os
+import json
+import re
+from datetime import datetime
+from typing import Optional, Union
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 import googlemaps
+from langsmith import traceable
 
 load_dotenv()
 
@@ -49,32 +54,132 @@ def _search_places(query: str, location: str = "") -> str:
     return output
 
 
-def _get_directions(origin: str, destination: str, mode: str = "driving") -> str:
-    """Get directions between two places."""
+def _parse_duration_minutes(duration_text: str) -> Optional[int]:
+    """Parse duration text to minutes (e.g., '1 hour 30 mins' -> 90)"""
+    if not duration_text:
+        return None
+    
+    total_minutes = 0
+    
+    # Match hours
+    hour_match = re.search(r'(\d+)\s*hour', duration_text, re.IGNORECASE)
+    if hour_match:
+        total_minutes += int(hour_match.group(1)) * 60
+    
+    # Match minutes
+    min_match = re.search(r'(\d+)\s*min', duration_text, re.IGNORECASE)
+    if min_match:
+        total_minutes += int(min_match.group(1))
+    
+    return total_minutes if total_minutes > 0 else None
+
+
+def _get_directions(
+    origin: str, 
+    destination: str, 
+    mode: str = "driving",
+    arrival_time: Optional[datetime] = None
+) -> dict:
+    """
+    Get directions between two places.
+    
+    Args:
+        origin: Starting location
+        destination: Destination location
+        mode: Transport mode (driving, walking, bicycling, transit)
+        arrival_time: Target arrival time (datetime object, used for transit mode)
+    
+    Returns:
+        dict with structured directions data:
+        - origin, destination
+        - distance_text, duration_text, duration_minutes
+        - requested_mode, actual_mode, fallback_used
+        - steps (list)
+        - text (formatted string for display)
+    """
     client = get_client()
     
-    directions = client.directions(origin, destination, mode=mode)
+    # Build API call parameters
+    api_params = {
+        "origin": origin,
+        "destination": destination,
+        "mode": mode,
+    }
+    
+    # if transit mode, add arrival_time
+    if mode == "transit" and arrival_time:
+        api_params["arrival_time"] = arrival_time
+    
+    directions = client.directions(**api_params)
+    
+    # Fallback logic: walking -> driving sequentially
+    fallback_mode = None
+    if not directions and mode == "transit":
+        # if close distance, walking mode is fallback
+        directions = client.directions(origin, destination, mode="walking")
+        if directions:
+            fallback_mode = "walking"
+        else:
+            # driving mode is fallback
+            directions = client.directions(origin, destination, mode="driving")
+            if directions:
+                fallback_mode = "driving"
     
     if not directions:
-        return f"No route found from {origin} to {destination}"
+        return {
+            "error": f"No route found from {origin} to {destination}",
+            "origin": origin,
+            "destination": destination,
+            "requested_mode": mode,
+        }
     
     route = directions[0]
     leg = route['legs'][0]
     
-    output = f"Directions: {origin} → {destination}\n"
-    output += f"Distance: {leg['distance']['text']}\n"
-    output += f"Duration: {leg['duration']['text']}\n"
-    output += f"Mode: {mode}\n\nSteps:\n"
+    actual_mode = fallback_mode if fallback_mode else mode
+    distance_text = leg['distance']['text']
+    duration_text = leg['duration']['text']
+    duration_minutes = _parse_duration_minutes(duration_text)
     
+    # Build steps list
+    steps = []
     for i, step in enumerate(leg['steps'][:10], 1):
         instruction = step['html_instructions'].replace('<b>', '').replace('</b>', '')
         instruction = instruction.replace('<div style="font-size:0.9em">', ' ').replace('</div>', '')
-        output += f"{i}. {instruction} ({step['distance']['text']})\n"
+        steps.append({
+            "step": i,
+            "instruction": instruction,
+            "distance": step['distance']['text']
+        })
+    
+    # Build formatted text output
+    text = f"Directions: {origin} -> {destination}\n"
+    text += f"Distance: {distance_text}\n"
+    text += f"Duration: {duration_text}\n"
+    
+    if fallback_mode:
+        text += f"Mode: {actual_mode} (transit replaced by {fallback_mode})\n\nSteps:\n"
+    else:
+        text += f"Mode: {actual_mode}\n\nSteps:\n"
+    
+    for s in steps:
+        text += f"{s['step']}. {s['instruction']} ({s['distance']})\n"
     
     if len(leg['steps']) > 10:
-        output += f"... and {len(leg['steps']) - 10} more steps\n"
+        text += f"... and {len(leg['steps']) - 10} more steps\n"
     
-    return output
+    return {
+        "origin": origin,
+        "destination": destination,
+        "distance_text": distance_text,
+        "duration_text": duration_text,
+        "duration_minutes": duration_minutes,
+        "requested_mode": mode,
+        "actual_mode": actual_mode,
+        "fallback_used": fallback_mode is not None,
+        "steps": steps,
+        "text": text,
+    }
 
 
 def _get_place_details(place_name: str) -> str:
@@ -112,9 +217,28 @@ def search_places(query: str, location: str = "") -> str:
     return _search_places(query, location)
 
 @mcp.tool()
-def get_directions(origin: str, destination: str, mode: str = "driving") -> str:
-    """Get directions between two places. mode: driving, walking, bicycling, transit"""
-    return _get_directions(origin, destination, mode)
+def get_directions(origin: str, destination: str, mode: str = "driving", arrival_time: str = "") -> str:
+    """
+    Get directions between two places.
+    
+    Args:
+        origin: Starting location
+        destination: Destination location
+        mode: Transport mode (driving, walking, bicycling, transit)
+        arrival_time: Target arrival time in ISO format (e.g., "2024-01-20T09:00:00"), used for transit mode
+    
+    Returns:
+        JSON string containing directions data with actual_mode field
+    """
+    parsed_arrival_time = None
+    if arrival_time and mode == "transit":
+        try:
+            parsed_arrival_time = datetime.fromisoformat(arrival_time)
+        except ValueError:
+            pass  # Invalid format, ignore
+    
+    result = _get_directions(origin, destination, mode, parsed_arrival_time)
+    return json.dumps(result, ensure_ascii=False)
 
 @mcp.tool()
 def get_place_details(place_name: str) -> str:
